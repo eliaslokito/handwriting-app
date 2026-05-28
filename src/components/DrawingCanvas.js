@@ -1,20 +1,22 @@
 /**
  * DrawingCanvas.js
- * Canvas de dibujo para capturar trazos con lápiz o dedo.
+ * Canvas de dibujo con soporte de multi-trazo y goma de borrar.
  *
- * Problema raíz del multi-trazo:
- *   canvasRef.current?.redraw() fuerza un repintado nativo de Skia pero NO
- *   dispara un re-render de React. Por eso pathsRef.current.map() no se
- *   re-evalúa y los paths completados nunca aparecen en el árbol JSX.
+ * Modos:
+ *   Dibujo  — acumula paths con PanResponder; forceRender al levantar la pluma
+ *   Goma    — círculo semitransparente sigue el dedo; elimina paths que toca
  *
- * Solución:
- *   - Durante el dibujo (onMove) → solo redraw() [rápido, sin re-render]
- *   - Al levantar la pluma   → forceRender() [dispara re-render de React]
- *   Los paths se acumulan en pathsRef y se muestran tras cada re-render.
+ * Detección de hardware:
+ *   S Pen  — si e.nativeEvent.buttons === 2 (botón lateral) al iniciar toque,
+ *             llama onToggleEraser para alternar el modo desde el padre
+ *   Apple Pencil doble toque — requiere UIPencilInteraction nativo (no
+ *             disponible en Expo Managed Workflow sin módulo nativo)
  *
- * Flujo de multi-trazo:
- *   levantar pluma → path se guarda → forceRender → React re-renderiza →
- *   canvas muestra todos los paths → usuario dibuja el siguiente trazo
+ * Por qué forceRender y no redraw():
+ *   redraw() repinta el canvas nativo pero NO dispara re-render de React,
+ *   así que pathsRef.current.map() nunca se re-evalúa. forceRender (dispatch
+ *   de useReducer, estable entre renders) sí dispara el re-render completo.
+ *   Durante el dibujo activo (onMove) solo usamos redraw() para máxima fluidez.
  */
 
 import React, {
@@ -27,6 +29,7 @@ import React, {
 import { View, StyleSheet, PanResponder } from 'react-native';
 import {
   Canvas,
+  Circle,
   Path,
   Skia,
   useCanvasRef,
@@ -35,25 +38,50 @@ import {
 } from '@shopify/react-native-skia';
 import { colors } from '../constants/theme';
 
-const GUIDE_COLOR  = 'rgba(28, 28, 26, 0.08)';
-const STROKE_COLOR = colors.grafito;
-const STROKE_WIDTH = 2.5;
-const CROP_PADDING = 14;
+const GUIDE_COLOR   = 'rgba(28, 28, 26, 0.08)';
+const STROKE_COLOR  = colors.grafito;
+const STROKE_WIDTH  = 2.5;
+const CROP_PADDING  = 14;
+const ERASER_RADIUS = 22; // radio del círculo de goma en px
 
-const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
-  const canvasRef      = useCanvasRef();
-  const pathsRef       = useRef([]);    // trazos completados (persisten entre levantadas)
-  const currentPath    = useRef(null);  // trazo en curso
-  const isDrawing      = useRef(false);
+/**
+ * Comprueba si un path choca con el círculo de la goma.
+ * Expande el bounding box del path por el ancho de trazo antes de comparar.
+ */
+function pathHitTest(path, ex, ey) {
+  const b = path.getBounds();
+  if (b.width <= 0 && b.height <= 0) return false;
 
-  // Refs estables para acceder a valores actuales dentro del PanResponder (useMemo [])
-  const onStrokeEndRef = useRef(onStrokeEnd);
-  onStrokeEndRef.current = onStrokeEnd;
+  const half   = STROKE_WIDTH / 2;
+  const left   = b.x - half;
+  const top    = b.y - half;
+  const right  = b.x + b.width  + half;
+  const bottom = b.y + b.height + half;
 
-  // forceRender: dispara re-render de React para que pathsRef.current.map()
-  // se re-evalúe y los nuevos paths aparezcan en el árbol JSX de Skia.
-  // useReducer setter ES estable entre renders (garantía de React).
-  const [, dispatch]  = useReducer(n => n + 1, 0);
+  // Punto más cercano del rect al centro de la goma
+  const nearX = Math.max(left, Math.min(ex, right));
+  const nearY = Math.max(top,  Math.min(ey, bottom));
+  const dist  = Math.sqrt((ex - nearX) ** 2 + (ey - nearY) ** 2);
+  return dist <= ERASER_RADIUS;
+}
+
+const DrawingCanvas = forwardRef(({ onStrokeEnd, onToggleEraser, isErasing, width, height }, ref) => {
+  const canvasRef    = useCanvasRef();
+  const pathsRef     = useRef([]);
+  const currentPath  = useRef(null);
+  const isDrawing    = useRef(false);
+  const eraserPosRef = useRef(null); // {x, y} mientras la goma toca la pantalla
+
+  // Refs estables para callbacks y props que cambian entre renders
+  const onStrokeEndRef    = useRef(onStrokeEnd);
+  const onToggleEraserRef = useRef(onToggleEraser);
+  const isErasingRef      = useRef(isErasing);
+  onStrokeEndRef.current    = onStrokeEnd;
+  onToggleEraserRef.current = onToggleEraser;
+  isErasingRef.current      = isErasing;
+
+  // forceRender dispara re-render de React para actualizar JSX de Skia
+  const [, dispatch]   = useReducer(n => n + 1, 0);
   const forceRenderRef = useRef(dispatch);
   forceRenderRef.current = dispatch;
 
@@ -66,29 +94,29 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
 
   // ─── API pública expuesta al padre ───────────────────────────────────────
   useImperativeHandle(ref, () => ({
-    /** Limpia todos los paths y fuerza re-render para vaciar el canvas */
+    /** Borra todos los paths y limpia el canvas */
     clear() {
       pathsRef.current    = [];
       currentPath.current = null;
       isDrawing.current   = false;
-      forceRenderRef.current(); // re-render limpia el JSX de Skia
+      eraserPosRef.current = null;
+      forceRenderRef.current();
     },
 
     /**
-     * Exporta el dibujo completo como PNG base64 recortado al bounding box.
-     * Incluye el trazo en curso si el usuario aún no levantó la pluma.
+     * Exporta como PNG base64 recortado al bounding box del trazo completo.
+     * Incluye el trazo en curso si el usuario no ha levantado la pluma.
      */
     async toDataUrl() {
-      const allPaths = currentPath.current
+      const all = currentPath.current
         ? [...pathsRef.current, currentPath.current]
         : [...pathsRef.current];
 
-      if (allPaths.length === 0) return null;
+      if (all.length === 0) return null;
 
-      // Calcular bounding box de todos los paths
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const path of allPaths) {
-        const b = path.getBounds();
+      for (const p of all) {
+        const b = p.getBounds();
         if (b.width > 0 || b.height > 0) {
           minX = Math.min(minX, b.x);
           minY = Math.min(minY, b.y);
@@ -96,14 +124,12 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
           maxY = Math.max(maxY, b.y + b.height);
         }
       }
-
       if (!isFinite(minX)) return null;
 
       const x = Math.max(0, minX - CROP_PADDING);
       const y = Math.max(0, minY - CROP_PADDING);
       const w = Math.min(width,  maxX + CROP_PADDING) - x;
       const h = Math.min(height, maxY + CROP_PADDING) - y;
-
       if (w <= 0 || h <= 0) return null;
 
       const image = canvasRef.current?.makeImageSnapshot({ x, y, width: w, height: h });
@@ -121,36 +147,68 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
     onMoveShouldSetPanResponder:  () => true,
 
     onPanResponderGrant: (e) => {
-      const { locationX, locationY } = e.nativeEvent;
-      const path = Skia.Path.Make();
-      path.moveTo(locationX, locationY);
-      currentPath.current = path;
-      isDrawing.current   = true;
+      const { locationX: x, locationY: y, buttons } = e.nativeEvent;
+
+      // Detectar botón lateral del S Pen (Android): buttons === 2
+      // En algunos ROMs de Samsung, sostener el botón lateral genera button=2
+      if (buttons === 2) {
+        onToggleEraserRef.current?.();
+        return;
+      }
+
+      if (isErasingRef.current) {
+        // Modo goma: mostrar cursor
+        eraserPosRef.current = { x, y };
+        forceRenderRef.current();
+      } else {
+        // Modo dibujo: iniciar path
+        const path = Skia.Path.Make();
+        path.moveTo(x, y);
+        currentPath.current = path;
+        isDrawing.current   = true;
+      }
     },
 
     onPanResponderMove: (e) => {
-      if (!isDrawing.current || !currentPath.current) return;
-      const { locationX, locationY } = e.nativeEvent;
-      currentPath.current.lineTo(locationX, locationY);
-      // Solo redraw() durante el dibujo activo — NO provoca re-render de React
-      // Skia repinta el path nativo directamente (muy rápido)
-      canvasRef.current?.redraw();
+      const { locationX: x, locationY: y } = e.nativeEvent;
+
+      if (isErasingRef.current) {
+        // Actualizar posición del cursor y eliminar paths tocados
+        eraserPosRef.current = { x, y };
+        const before = pathsRef.current.length;
+        pathsRef.current = pathsRef.current.filter(p => !pathHitTest(p, x, y));
+        // Un solo forceRender actualiza cursor + paths borrados
+        forceRenderRef.current();
+      } else {
+        if (!isDrawing.current || !currentPath.current) return;
+        currentPath.current.lineTo(x, y);
+        // Solo redraw() durante el trazo activo — sin overhead de re-render
+        canvasRef.current?.redraw();
+      }
     },
 
     onPanResponderRelease: () => {
+      if (isErasingRef.current) {
+        eraserPosRef.current = null; // ocultar cursor al levantar
+        forceRenderRef.current();
+        return;
+      }
       if (!isDrawing.current || !currentPath.current) return;
       isDrawing.current   = false;
       pathsRef.current    = [...pathsRef.current, currentPath.current];
       currentPath.current = null;
-      // forceRender dispara re-render de React → el JSX re-evalúa
-      // pathsRef.current.map() → Skia muestra el path guardado
-      // El usuario puede levantar la pluma y seguir dibujando
+      // forceRender hace que React re-renderice y el canvas muestre el path
       forceRenderRef.current();
       onStrokeEndRef.current?.();
     },
 
-    // Si el gesto es cancelado (notificación del sistema, etc.) — guardar igual
+    // Si el sistema cancela el gesto (alerta, etc.) — guardar el path igualmente
     onPanResponderTerminate: () => {
+      if (isErasingRef.current) {
+        eraserPosRef.current = null;
+        forceRenderRef.current();
+        return;
+      }
       if (isDrawing.current && currentPath.current) {
         isDrawing.current   = false;
         pathsRef.current    = [...pathsRef.current, currentPath.current];
@@ -158,7 +216,10 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
         forceRenderRef.current();
       }
     },
-  }), []); // deps vacío — todas las dependencias son refs estables
+  }), []); // deps vacío — todo accedido via refs estables
+
+  // ─── Posición de la goma para renderizado ────────────────────────────────
+  const ep = eraserPosRef.current;
 
   return (
     <View
@@ -178,7 +239,7 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
           />
         ))}
 
-        {/* Trazos completados — visibles tras cada forceRender */}
+        {/* Trazos completados */}
         {pathsRef.current.map((p, i) => (
           <Path
             key={i}
@@ -191,7 +252,7 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
           />
         ))}
 
-        {/* Trazo en curso — Skia lo repinta con redraw() sin re-render */}
+        {/* Trazo en curso — repintado con redraw() sin re-render */}
         {currentPath.current && (
           <Path
             path={currentPath.current}
@@ -201,6 +262,22 @@ const DrawingCanvas = forwardRef(({ onStrokeEnd, width, height }, ref) => {
             strokeJoin="round"
             strokeCap="round"
           />
+        )}
+
+        {/* Cursor de la goma — visible solo mientras toca la pantalla */}
+        {isErasing && ep && (
+          <>
+            <Circle
+              cx={ep.x} cy={ep.y} r={ERASER_RADIUS}
+              color="rgba(100, 100, 100, 0.12)"
+            />
+            <Circle
+              cx={ep.x} cy={ep.y} r={ERASER_RADIUS}
+              color={colors.piedra}
+              style="stroke"
+              strokeWidth={1.5}
+            />
+          </>
         )}
 
       </Canvas>

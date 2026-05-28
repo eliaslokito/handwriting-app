@@ -50,6 +50,7 @@ export default function OnboardingScreen({ navigation }) {
 
   const [currentIdx, setCurrentIdx] = useState(0);
   const [hasDrawn,   setHasDrawn]   = useState(false);
+  const [isErasing,  setIsErasing]  = useState(false);
   const canvasRef   = useRef(null);
   const charNavRef  = useRef(null);
 
@@ -87,6 +88,11 @@ export default function OnboardingScreen({ navigation }) {
   const handleClear = useCallback(() => {
     canvasRef.current?.clear();
     setHasDrawn(false);
+  }, []);
+
+  // ─── Alternar entre modo dibujo y goma ──────────────────────────────────
+  const handleToggleEraser = useCallback(() => {
+    setIsErasing(prev => !prev);
   }, []);
 
   // ─── Navegar dentro del grupo activo ─────────────────────────────────
@@ -246,20 +252,35 @@ export default function OnboardingScreen({ navigation }) {
           </View>
         )}
 
-        {/* ── Hint de multi-trazo ───────────────────────────────────── */}
-        {hasDrawn && !isFull && (
-          <View style={styles.multiStrokeTip}>
-            <Text style={styles.multiStrokeTipText}>
-              Puedes levantar la pluma y seguir dibujando. Presiona "Guardar trazo" cuando termines.
+        {/* ── Toggle dibujo / goma ──────────────────────────────────── */}
+        <View style={styles.modeToggle}>
+          <TouchableOpacity
+            style={[styles.modeBtn, !isErasing && styles.modeBtnActive]}
+            onPress={() => setIsErasing(false)}
+            activeOpacity={0.8}
+          >
+            <Text style={[styles.modeBtnText, !isErasing && styles.modeBtnTextActive]}>
+              Dibujar
             </Text>
-          </View>
-        )}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.modeBtn, isErasing && styles.modeBtnActive]}
+            onPress={() => setIsErasing(true)}
+            activeOpacity={0.8}
+          >
+            <Text style={[styles.modeBtnText, isErasing && styles.modeBtnTextActive]}>
+              Goma
+            </Text>
+          </TouchableOpacity>
+        </View>
 
         {/* ── Canvas de dibujo ──────────────────────────────────────── */}
         <DrawingCanvas
           ref={canvasRef}
           width={CANVAS_W}
           height={CANVAS_H}
+          isErasing={isErasing}
+          onToggleEraser={handleToggleEraser}
           onStrokeEnd={() => setHasDrawn(true)}
         />
         <Text style={styles.canvasHint}>
@@ -514,18 +535,31 @@ const styles = StyleSheet.create({
     color: colors.piedra,
     textAlign: 'center',
   },
-  multiStrokeTip: {
-    backgroundColor: '#EEF4FF',
-    borderRadius: radius.md,
-    padding: spacing.sm,
-    marginBottom: spacing.sm,
+  // Toggle dibujo / goma
+  modeToggle: {
+    flexDirection: 'row',
+    alignSelf: 'center',
+    borderRadius: radius.full,
     borderWidth: borderWidth.thin,
-    borderColor: '#C0D4F5',
+    borderColor: colors.borde,
+    overflow: 'hidden',
+    marginBottom: spacing.sm,
+    backgroundColor: colors.hueso2,
   },
-  multiStrokeTipText: {
-    fontSize: fontSizes.xs,
-    color: '#2D5FA8',
-    textAlign: 'center',
+  modeBtn: {
+    paddingHorizontal: spacing.xl,
+    paddingVertical: spacing.xs + 2,
+  },
+  modeBtnActive: {
+    backgroundColor: colors.grafito,
+  },
+  modeBtnText: {
+    fontSize: fontSizes.sm,
+    color: colors.carbon,
+    fontWeight: '500',
+  },
+  modeBtnTextActive: {
+    color: colors.hueso,
   },
 
   // Canvas

@@ -2,15 +2,18 @@
  * AppContext.js
  * Estado global de la app mediante React Context.
  * Maneja: trazos capturados por carácter, estado del onboarding,
- * y persistencia local con expo-file-system.
+ * y persistencia local usando la nueva API de expo-file-system (File/Paths).
+ *
+ * API de almacenamiento (SDK 56+):
+ *   new File(Paths.document, 'archivo.json') → referencia de archivo
+ *   file.exists                              → boolean sincrónico
+ *   await file.text()                        → lee contenido como string
+ *   file.write(string)                       → escribe (sincrónico)
  */
 
 import React, { createContext, useContext, useReducer, useEffect } from 'react';
-import * as FileSystem from 'expo-file-system';
+import { File, Paths } from 'expo-file-system/next';
 import { ALL_CHARS } from '../constants/characters';
-
-// ─── Ruta de almacenamiento local ───────────────────────────────────────────
-const STORAGE_PATH = FileSystem.documentDirectory + 'handwriting_font.json';
 
 // ─── Estado inicial ──────────────────────────────────────────────────────────
 const buildInitialStrokes = () => {
@@ -20,7 +23,7 @@ const buildInitialStrokes = () => {
 };
 
 const initialState = {
-  strokes: buildInitialStrokes(), // { 'A': ['dataUrl1', 'dataUrl2', ...], ... }
+  strokes: buildInitialStrokes(),
   onboardingComplete: false,
   isLoading: true,
 };
@@ -60,10 +63,7 @@ function reducer(state, action) {
       const { char, index } = action.payload;
       const updated = [...(state.strokes[char] ?? [])];
       updated.splice(index, 1);
-      return {
-        ...state,
-        strokes: { ...state.strokes, [char]: updated },
-      };
+      return { ...state, strokes: { ...state.strokes, [char]: updated } };
     }
 
     case ACTION.COMPLETE_ONBOARDING:
@@ -83,23 +83,18 @@ const AppContext = createContext(null);
 export function AppProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  useEffect(() => {
-    loadFromDisk();
-  }, []);
+  useEffect(() => { loadFromDisk(); }, []);
 
   useEffect(() => {
-    if (!state.isLoading) {
-      saveToDisk(state);
-    }
+    if (!state.isLoading) saveToDisk(state);
   }, [state.strokes, state.onboardingComplete]);
 
+  /** Lee los datos guardados usando la nueva API File */
   async function loadFromDisk() {
     try {
-      const info = await FileSystem.getInfoAsync(STORAGE_PATH);
-      if (info.exists) {
-        const raw = await FileSystem.readAsStringAsync(STORAGE_PATH, {
-          encoding: FileSystem.EncodingType.UTF8,
-        });
+      const file = new File(Paths.document, 'handwriting_font.json');
+      if (file.exists) {
+        const raw    = await file.text();
         const parsed = JSON.parse(raw);
         dispatch({ type: ACTION.LOAD_DATA, payload: parsed });
       } else {
@@ -111,52 +106,34 @@ export function AppProvider({ children }) {
     }
   }
 
-  async function saveToDisk(currentState) {
+  /** Guarda los datos usando la nueva API File (write es sincrónico) */
+  function saveToDisk(currentState) {
     try {
       const data = {
         strokes: currentState.strokes,
         onboardingComplete: currentState.onboardingComplete,
       };
-      await FileSystem.writeAsStringAsync(STORAGE_PATH, JSON.stringify(data), {
-        encoding: FileSystem.EncodingType.UTF8,
-      });
+      new File(Paths.document, 'handwriting_font.json').write(JSON.stringify(data));
     } catch (e) {
       console.warn('Error guardando datos:', e);
     }
   }
 
   // ─── Acciones públicas ──────────────────────────────────────────────
-  const addStroke = (char, dataUrl) =>
-    dispatch({ type: ACTION.ADD_STROKE, payload: { char, dataUrl } });
+  const addStroke       = (char, dataUrl) => dispatch({ type: ACTION.ADD_STROKE,          payload: { char, dataUrl } });
+  const deleteStroke    = (char, index)   => dispatch({ type: ACTION.DELETE_STROKE,        payload: { char, index } });
+  const completeOnboarding = ()           => dispatch({ type: ACTION.COMPLETE_ONBOARDING });
+  const resetAll           = ()           => dispatch({ type: ACTION.RESET });
 
-  const deleteStroke = (char, index) =>
-    dispatch({ type: ACTION.DELETE_STROKE, payload: { char, index } });
-
-  const completeOnboarding = () =>
-    dispatch({ type: ACTION.COMPLETE_ONBOARDING });
-
-  const resetAll = () =>
-    dispatch({ type: ACTION.RESET });
-
-  // ─── Helpers de consulta ────────────────────────────────────────────
-
-  const capturedCount = () =>
-    ALL_CHARS.filter(c => (state.strokes[c]?.length ?? 0) > 0).length;
-
-  const progress = () => capturedCount() / ALL_CHARS.length;
-
-  const strokesFor = (char) => state.strokes[char] ?? [];
+  const capturedCount = () => ALL_CHARS.filter(c => (state.strokes[c]?.length ?? 0) > 0).length;
+  const progress      = () => capturedCount() / ALL_CHARS.length;
+  const strokesFor    = (char) => state.strokes[char] ?? [];
 
   return (
     <AppContext.Provider value={{
       ...state,
-      addStroke,
-      deleteStroke,
-      completeOnboarding,
-      resetAll,
-      capturedCount,
-      progress,
-      strokesFor,
+      addStroke, deleteStroke, completeOnboarding, resetAll,
+      capturedCount, progress, strokesFor,
     }}>
       {children}
     </AppContext.Provider>
