@@ -15,8 +15,14 @@
  */
 
 import React from 'react';
-import { ActivityIndicator, View } from 'react-native';
+import { ActivityIndicator, View, LogBox } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
+
+// InteractionManager es usado internamente por @react-navigation/stack para
+// sincronizar animaciones de transición. RN 0.85 emite un warning de deprecación
+// pero la funcionalidad no está rota — se suprime hasta que React Navigation
+// migre a la nueva API del scheduler.
+LogBox.ignoreLogs(['InteractionManager']);
 import { createStackNavigator } from '@react-navigation/stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
