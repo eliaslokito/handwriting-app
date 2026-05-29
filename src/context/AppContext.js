@@ -33,6 +33,7 @@ const ACTION = {
   LOAD_DATA:           'LOAD_DATA',
   ADD_STROKE:          'ADD_STROKE',
   DELETE_STROKE:       'DELETE_STROKE',
+  REPLACE_STROKE:      'REPLACE_STROKE',
   COMPLETE_ONBOARDING: 'COMPLETE_ONBOARDING',
   RESET:               'RESET',
 };
@@ -63,6 +64,13 @@ function reducer(state, action) {
       const { char, index } = action.payload;
       const updated = [...(state.strokes[char] ?? [])];
       updated.splice(index, 1);
+      return { ...state, strokes: { ...state.strokes, [char]: updated } };
+    }
+
+    case ACTION.REPLACE_STROKE: {
+      const { char, index, dataUrl } = action.payload;
+      const updated = [...(state.strokes[char] ?? [])];
+      updated[index] = dataUrl;
       return { ...state, strokes: { ...state.strokes, [char]: updated } };
     }
 
@@ -120,10 +128,11 @@ export function AppProvider({ children }) {
   }
 
   // ─── Acciones públicas ──────────────────────────────────────────────
-  const addStroke       = (char, dataUrl) => dispatch({ type: ACTION.ADD_STROKE,          payload: { char, dataUrl } });
-  const deleteStroke    = (char, index)   => dispatch({ type: ACTION.DELETE_STROKE,        payload: { char, index } });
-  const completeOnboarding = ()           => dispatch({ type: ACTION.COMPLETE_ONBOARDING });
-  const resetAll           = ()           => dispatch({ type: ACTION.RESET });
+  const addStroke       = (char, dataUrl)        => dispatch({ type: ACTION.ADD_STROKE,     payload: { char, dataUrl } });
+  const deleteStroke    = (char, index)          => dispatch({ type: ACTION.DELETE_STROKE,  payload: { char, index } });
+  const replaceStroke   = (char, index, dataUrl) => dispatch({ type: ACTION.REPLACE_STROKE, payload: { char, index, dataUrl } });
+  const completeOnboarding = ()                  => dispatch({ type: ACTION.COMPLETE_ONBOARDING });
+  const resetAll           = ()                  => dispatch({ type: ACTION.RESET });
 
   const capturedCount = () => ALL_CHARS.filter(c => (state.strokes[c]?.length ?? 0) > 0).length;
   const progress      = () => capturedCount() / ALL_CHARS.length;
@@ -132,7 +141,7 @@ export function AppProvider({ children }) {
   return (
     <AppContext.Provider value={{
       ...state,
-      addStroke, deleteStroke, completeOnboarding, resetAll,
+      addStroke, deleteStroke, replaceStroke, completeOnboarding, resetAll,
       capturedCount, progress, strokesFor,
     }}>
       {children}

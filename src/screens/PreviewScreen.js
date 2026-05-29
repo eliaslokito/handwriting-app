@@ -3,14 +3,15 @@
  * Pantalla de vista previa del apunte generado.
  *
  * Recibe: text, sheetFormat, fontSize
- * Renderiza: cada carácter del texto usando los trazos guardados del usuario
- * con variación aleatoria de rotación (±2°) y posición (±2px)
+ * Renderiza: cada carácter con sus paths vectoriales escalados via Skia.
+ * Aplica suavizado Catmull-Rom al renderizar para convertir los puntos
+ * crudos [[x,y]] en curvas bezier cúbicas fluidas.
  *
- * NOTA: Esta es la versión base del renderizador.
- * El motor completo de renderización se refinará en iteraciones siguientes.
+ * Retrocompatibilidad: strokes sin paths vectoriales ({pts}) caen al fallback
+ * de texto semitransparente.
  */
 
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import {
   View,
   Text,
@@ -22,53 +23,109 @@ import {
   Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Canvas, Image as SkiaImage, useCanvasRef, Skia } from '@shopify/react-native-skia';
-import { Platform } from 'react-native';
+import {
+  Canvas,
+  Path,
+  Group,
+  Skia,
+} from '@shopify/react-native-skia';
 import { useApp } from '../context/AppContext';
 import { colors, spacing, fontSizes, radius, borderWidth } from '../constants/theme';
 
 const { width: SCREEN_W } = Dimensions.get('window');
 
-// Tamaño de letra en px por opción
-const CHAR_SIZE = { small: 28, medium: 38, large: 52 };
-
-// Interlineado
+const CHAR_SIZE          = { small: 28, medium: 38, large: 52 };
 const LINE_HEIGHT_FACTOR = 1.8;
+const SHEET_PADDING      = 24;
+const WRITE_WIDTH        = SCREEN_W - SHEET_PADDING * 2;
 
-// Padding interno de la hoja
-const SHEET_PADDING = 24;
+// ─── Helpers de formato de stroke (retrocompatibilidad) ──────────────────────
 
-// Ancho disponible para escribir
-const WRITE_WIDTH = SCREEN_W - SHEET_PADDING * 2;
+function getStroke(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') return { dataUrl: raw, paths: [], bbox: null };
+  return raw;
+}
+
+// ─── Suavizado Catmull-Rom → Skia Path ───────────────────────────────────────
+
+/**
+ * Convierte un array de puntos [[x,y],...] a un SkiaPath suavizado con
+ * interpolación Catmull-Rom. La curva pasa por todos los puntos originales,
+ * lo que preserva la forma del trazo y evita overshooting.
+ *
+ * Para cada segmento i→i+1, los handles bezier se derivan de los vecinos:
+ *   cp1 = p[i]   + (p[i+1] - p[i-1]) / 6
+ *   cp2 = p[i+1] - (p[i+2] - p[i])   / 6
+ * Los extremos usan puntos fantasma reflejados para mantener la tangente.
+ */
+function catmullRomToSkia(pts) {
+  if (!pts || pts.length < 2) return null;
+
+  const path = Skia.Path.Make();
+  path.moveTo(pts[0][0], pts[0][1]);
+
+  if (pts.length === 2) {
+    path.lineTo(pts[1][0], pts[1][1]);
+    return path;
+  }
+
+  const n = pts.length;
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = pts[i - 1] ?? [2 * pts[0][0] - pts[1][0], 2 * pts[0][1] - pts[1][1]];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2] ?? [2 * pts[n-1][0] - pts[n-2][0], 2 * pts[n-1][1] - pts[n-2][1]];
+
+    path.cubicTo(
+      p1[0] + (p2[0] - p0[0]) / 6,  p1[1] + (p2[1] - p0[1]) / 6,
+      p2[0] - (p3[0] - p1[0]) / 6,  p2[1] - (p3[1] - p1[1]) / 6,
+      p2[0], p2[1]
+    );
+  }
+  return path;
+}
+
+// ─── Cálculo de transformación bbox → cuadrado destino ───────────────────────
+
+/**
+ * Mapea el bounding box del trazo original al cuadrado de `size` px.
+ * Escala uniforme (aspect-ratio preservado) con margen visual del 15%.
+ * Alinea el contenido 10% desde el top del cuadrado para dejar espacio
+ * a descendentes y respetar la baseline.
+ */
+function computeTransform(bbox, size) {
+  if (!bbox || bbox.w <= 0 || bbox.h <= 0) return null;
+  const scale = Math.min(size / bbox.w, size / bbox.h) * 0.85;
+  return {
+    scale,
+    tx: (size - bbox.w * scale) / 2 - bbox.x * scale,
+    ty: size * 0.10 - bbox.y * scale,
+  };
+}
+
+// ─── Pantalla principal ───────────────────────────────────────────────────────
 
 export default function PreviewScreen({ route, navigation }) {
   const { text, sheetFormat, fontSize } = route.params;
   const { strokesFor } = useApp();
-  const canvasRef = useCanvasRef();
-  const [rendering, setRendering] = useState(true);
-  const [renderData, setRenderData] = useState([]);
+  const [rendering,  setRendering]  = useState(true);
+  const [renderData, setRenderData] = useState({ items: [], totalHeight: 400 });
 
   const charPx      = CHAR_SIZE[fontSize];
   const lineHeight  = Math.round(charPx * LINE_HEIGHT_FACTOR);
   const charSpacing = Math.round(charPx * 0.55);
 
-  // ─── Construir datos de renderización ──────────────────────────────────
-  useEffect(() => {
-    buildRenderData();
-  }, []);
+  useEffect(() => { buildRenderData(); }, []);
 
-  async function buildRenderData() {
+  function buildRenderData() {
     const chars = text.split('');
     const items = [];
     let x = SHEET_PADDING;
     let y = SHEET_PADDING + charPx;
 
     for (const char of chars) {
-      if (char === '\n') {
-        x = SHEET_PADDING;
-        y += lineHeight;
-        continue;
-      }
+      if (char === '\n') { x = SHEET_PADDING; y += lineHeight; continue; }
 
       if (char === ' ') {
         x += charSpacing * 0.6;
@@ -76,57 +133,33 @@ export default function PreviewScreen({ route, navigation }) {
         continue;
       }
 
-      // Obtener trazo aleatorio para este carácter
-      const strokes = strokesFor(char.toLowerCase()) ?? strokesFor(char);
-      const dataUrl  = strokes?.length
-        ? strokes[Math.floor(Math.random() * strokes.length)]
+      // Buscar trazo: primero el carácter exacto, luego su minúscula
+      const rawStrokes = strokesFor(char) ?? strokesFor(char.toLowerCase());
+      const rawStroke  = rawStrokes?.length
+        ? rawStrokes[Math.floor(Math.random() * rawStrokes.length)]
         : null;
+      const stroke = getStroke(rawStroke);
 
-      // Variación aleatoria — hace que no parezca robótico
-      const rotation  = (Math.random() - 0.5) * 4; // ±2°
-      const offsetX   = (Math.random() - 0.5) * 4; // ±2px
-      const offsetY   = (Math.random() - 0.5) * 4; // ±2px
+      const rotation = (Math.random() - 0.5) * 4;
+      const offsetX  = (Math.random() - 0.5) * 4;
+      const offsetY  = (Math.random() - 0.5) * 4;
 
-      items.push({ char, dataUrl, x: x + offsetX, y: y + offsetY, rotation, size: charPx });
+      items.push({ char, stroke, x: x + offsetX, y: y + offsetY, rotation, size: charPx });
 
       x += charSpacing;
-
-      // Salto de línea automático
-      if (x + charSpacing > WRITE_WIDTH) {
-        x = SHEET_PADDING;
-        y += lineHeight;
-      }
+      if (x + charSpacing > WRITE_WIDTH) { x = SHEET_PADDING; y += lineHeight; }
     }
 
-    const totalHeight = y + lineHeight + SHEET_PADDING;
-    setRenderData({ items, totalHeight });
+    setRenderData({ items, totalHeight: y + lineHeight + SHEET_PADDING });
     setRendering(false);
   }
 
-  // ─── Exportar ───────────────────────────────────────────────────────────
-  const handleExport = async (format) => {
-    const { status } = await MediaLibrary.requestPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permiso necesario', 'Necesitamos acceso a tu galería para guardar el apunte.');
-      return;
-    }
-
-    const image = canvasRef.current?.makeImageSnapshot();
-    if (!image) return;
-
-    Alert.alert('Exportado', `El apunte se guardó como ${format.toUpperCase()} en tu galería.`);
+  const handleExport = () => {
+    Alert.alert('Exportación', 'Próximamente — requiere expo-media-library + react-native-view-shot.');
   };
-
-  const sheetBg = sheetFormat === 'lined'
-    ? '#FAFAF7'
-    : sheetFormat === 'grid'
-      ? '#FAFAF7'
-      : '#FAFAF7';
 
   return (
     <SafeAreaView style={styles.safe}>
-
-      {/* ── Header ─────────────────────────────────────────────── */}
       <View style={styles.header}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Text style={styles.backBtnText}>← Volver</Text>
@@ -141,38 +174,24 @@ export default function PreviewScreen({ route, navigation }) {
           <Text style={styles.loadingText}>Generando apunte...</Text>
         </View>
       ) : (
-        <ScrollView
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={styles.scrollContent}
-        >
-
-          {/* ── Hoja renderizada ─────────────────────────────────── */}
-          <View style={[styles.sheet, { backgroundColor: sheetBg, height: renderData.totalHeight }]}>
-
-            {/* Líneas de hoja */}
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+          <View style={[styles.sheet, { height: renderData.totalHeight }]}>
             {sheetFormat === 'lined' && renderLineGuides(renderData.totalHeight, lineHeight, charPx)}
             {sheetFormat === 'grid'  && renderGridGuides(renderData.totalHeight, SCREEN_W)}
 
-            {/* Caracteres */}
-            {renderData.items?.map((item, i) => (
+            {renderData.items.map((item, i) => (
               <CharacterToken key={i} item={item} />
             ))}
           </View>
 
-          {/* ── Botones de exportación ────────────────────────────── */}
           <Text style={styles.exportLabel}>EXPORTAR COMO</Text>
           <View style={styles.exportRow}>
             {['PNG', 'JPG', 'PDF'].map(fmt => (
-              <TouchableOpacity
-                key={fmt}
-                style={styles.exportBtn}
-                onPress={() => handleExport(fmt.toLowerCase())}
-              >
+              <TouchableOpacity key={fmt} style={styles.exportBtn} onPress={handleExport}>
                 <Text style={styles.exportBtnText}>{fmt}</Text>
               </TouchableOpacity>
             ))}
           </View>
-
         </ScrollView>
       )}
     </SafeAreaView>
@@ -180,51 +199,89 @@ export default function PreviewScreen({ route, navigation }) {
 }
 
 // ─── Token de carácter individual ────────────────────────────────────────────
-function CharacterToken({ item }) {
-  const { char, dataUrl, x, y, rotation, size } = item;
 
-  if (!dataUrl) {
-    // Fallback: mostrar el carácter como texto si no hay trazo capturado
+function CharacterToken({ item }) {
+  const { char, stroke, x, y, rotation, size } = item;
+
+  const posStyle = {
+    position: 'absolute',
+    left: x,
+    top:  y - size,
+    width:  size,
+    height: size,
+    transform: [{ rotate: `${rotation}deg` }],
+  };
+
+  // Sin trazo capturado → fallback semitransparente
+  if (!stroke) {
     return (
-      <Text style={{
-        position: 'absolute',
-        left: x,
-        top: y - size,
-        fontSize: size,
-        color: colors.carbon,
-        transform: [{ rotate: `${rotation}deg` }],
-        opacity: 0.4,
-      }}>
+      <Text style={[posStyle, { fontSize: size * 0.8, color: colors.carbon, opacity: 0.3 }]}>
+        {char}
+      </Text>
+    );
+  }
+
+  // Verificar que hay datos vectoriales válidos con bbox
+  const hasVector = Array.isArray(stroke.paths) &&
+    stroke.paths.length > 0 &&
+    stroke.paths[0]?.pts?.length >= 2 &&
+    stroke.bbox != null;
+
+  // Construir paths Skia suavizados — solo si hay datos vectoriales
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const skPaths = useMemo(() => {
+    if (!hasVector) return [];
+    return stroke.paths
+      .map(p => catmullRomToSkia(p.pts))
+      .filter(Boolean);
+  }, [stroke, hasVector]);
+
+  const transform = hasVector ? computeTransform(stroke.bbox, size) : null;
+
+  // Sin vector válido → fallback de texto
+  if (!hasVector || !transform || skPaths.length === 0) {
+    return (
+      <Text style={[posStyle, { fontSize: size * 0.75, color: colors.carbon, opacity: 0.35 }]}>
         {char}
       </Text>
     );
   }
 
   return (
-    <View style={{
-      position: 'absolute',
-      left: x,
-      top: y - size,
-      width: size,
-      height: size,
-      transform: [{ rotate: `${rotation}deg` }],
-    }}>
-      {/* La imagen del trazo se renderiza aquí — se refinará con Skia */}
-      <Text style={{ fontSize: size * 0.8, color: colors.carbon }}>{char}</Text>
+    <View style={posStyle}>
+      <Canvas style={{ width: size, height: size }}>
+        <Group transform={[
+          { translateX: transform.tx },
+          { translateY: transform.ty },
+          { scaleX: transform.scale },
+          { scaleY: transform.scale },
+        ]}>
+          {skPaths.map((skPath, i) => (
+            <Path
+              key={i}
+              path={skPath}
+              color={colors.grafito}
+              strokeWidth={stroke.paths[i].w ?? 2.5}
+              style="stroke"
+              strokeJoin="round"
+              strokeCap="round"
+            />
+          ))}
+        </Group>
+      </Canvas>
     </View>
   );
 }
 
-// ─── Helpers de fondo de hoja ─────────────────────────────────────────────────
+// ─── Fondos de hoja ───────────────────────────────────────────────────────────
+
 function renderLineGuides(totalHeight, lineHeight, charPx) {
   const lines = [];
-  for (let y = SHEET_PADDING + charPx; y < totalHeight; y += lineHeight) {
+  for (let ly = SHEET_PADDING + charPx; ly < totalHeight; ly += lineHeight) {
     lines.push(
-      <View key={y} style={{
-        position: 'absolute',
-        left: 0, right: 0,
-        top: y + 6,
-        height: 0.5,
+      <View key={ly} style={{
+        position: 'absolute', left: 0, right: 0,
+        top: ly + 6, height: 0.5,
         backgroundColor: 'rgba(136,135,128,0.25)',
       }} />
     );
@@ -235,14 +292,16 @@ function renderLineGuides(totalHeight, lineHeight, charPx) {
 function renderGridGuides(totalHeight, totalWidth) {
   const lines = [];
   const step = 24;
-  for (let y = 0; y < totalHeight; y += step) {
-    lines.push(<View key={`h${y}`} style={{ position: 'absolute', left: 0, right: 0, top: y, height: 0.5, backgroundColor: 'rgba(136,135,128,0.18)' }} />);
+  for (let ly = 0; ly < totalHeight; ly += step) {
+    lines.push(<View key={`h${ly}`} style={{ position: 'absolute', left: 0, right: 0, top: ly, height: 0.5, backgroundColor: 'rgba(136,135,128,0.18)' }} />);
   }
-  for (let x = 0; x < totalWidth; x += step) {
-    lines.push(<View key={`v${x}`} style={{ position: 'absolute', top: 0, bottom: 0, left: x, width: 0.5, backgroundColor: 'rgba(136,135,128,0.18)' }} />);
+  for (let lx = 0; lx < totalWidth; lx += step) {
+    lines.push(<View key={`v${lx}`} style={{ position: 'absolute', top: 0, bottom: 0, left: lx, width: 0.5, backgroundColor: 'rgba(136,135,128,0.18)' }} />);
   }
   return lines;
 }
+
+// ─── Estilos ──────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.hueso },
@@ -255,17 +314,18 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.md,
     backgroundColor: colors.grafito,
   },
-  headerTitle: { fontSize: fontSizes.lg, color: colors.hueso, fontWeight: '400' },
-  backBtn: { width: 60 },
-  backBtnText: { fontSize: fontSizes.sm, color: colors.piedra },
+  headerTitle:  { fontSize: fontSizes.lg, color: colors.hueso, fontWeight: '400' },
+  backBtn:      { width: 60 },
+  backBtnText:  { fontSize: fontSizes.sm, color: colors.piedra },
 
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: spacing.md },
-  loadingText: { fontSize: fontSizes.md, color: colors.piedra },
+  loadingText:      { fontSize: fontSizes.md, color: colors.piedra },
 
   scrollContent: { padding: spacing.lg, paddingBottom: spacing.xxl, gap: spacing.md },
 
   sheet: {
     width: '100%',
+    backgroundColor: '#FAFAF7',
     borderRadius: radius.lg,
     borderWidth: borderWidth.thin,
     borderColor: colors.borde,
@@ -273,13 +333,8 @@ const styles = StyleSheet.create({
     position: 'relative',
   },
 
-  exportLabel: {
-    fontSize: fontSizes.xs,
-    color: colors.piedra,
-    letterSpacing: 0.7,
-    marginTop: spacing.sm,
-  },
-  exportRow: { flexDirection: 'row', gap: spacing.sm },
+  exportLabel: { fontSize: fontSizes.xs, color: colors.piedra, letterSpacing: 0.7, marginTop: spacing.sm },
+  exportRow:   { flexDirection: 'row', gap: spacing.sm },
   exportBtn: {
     flex: 1,
     paddingVertical: spacing.md,

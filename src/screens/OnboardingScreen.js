@@ -20,11 +20,13 @@ import {
   StyleSheet,
   Alert,
   Dimensions,
+  Animated,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import DrawingCanvas from '../components/DrawingCanvas';
 import StrokeThumbnail from '../components/StrokeThumbnail';
+import SizeSlider from '../components/SizeSlider';
 import { useApp } from '../context/AppContext';
 import {
   ALL_CHARS,
@@ -40,17 +42,33 @@ const { width: SCREEN_W } = Dimensions.get('window');
 const CANVAS_W = SCREEN_W - spacing.lg * 2;
 const CANVAS_H = 200;
 
+// Altura del contenedor del slider cuando está abierto
+const SLIDER_PANEL_H = 132;
+
+// Helpers para el nuevo formato de stroke: { dataUrl, paths } o string (legado)
+const getStrokeDataUrl = (stroke) =>
+  typeof stroke === 'string' ? stroke : (stroke?.dataUrl ?? '');
+const getStrokePaths = (stroke) =>
+  typeof stroke === 'object' && Array.isArray(stroke?.paths) ? stroke.paths : [];
+
 // Índice global del primer carácter de cada grupo
 const GROUP_OFFSETS = CHARACTER_GROUPS.map((_, i) =>
   CHARACTER_GROUPS.slice(0, i).reduce((sum, g) => sum + g.chars.length, 0)
 );
 
 export default function OnboardingScreen({ navigation }) {
-  const { strokesFor, addStroke, deleteStroke, completeOnboarding, capturedCount } = useApp();
+  const { strokesFor, addStroke, deleteStroke, replaceStroke, completeOnboarding, capturedCount } = useApp();
 
-  const [currentIdx, setCurrentIdx] = useState(0);
-  const [hasDrawn,   setHasDrawn]   = useState(false);
-  const [isErasing,  setIsErasing]  = useState(false);
+  const [currentIdx,        setCurrentIdx]        = useState(0);
+  const [hasDrawn,          setHasDrawn]          = useState(false);
+  const [isErasing,         setIsErasing]         = useState(false);
+  const [selectedStrokeIdx, setSelectedStrokeIdx] = useState(null);
+  const [penWidth,          setPenWidth]          = useState(2.5);
+  const [eraserRad,         setEraserRad]         = useState(16);
+  const [sliderFor,         setSliderFor]         = useState(null); // 'pen' | 'eraser' | null
+  const sliderAnim       = useRef(new Animated.Value(0)).current;
+  const tabIndicatorAnim = useRef(new Animated.Value(0)).current;
+  const tabContainerW    = useRef(0);
   const canvasRef   = useRef(null);
   const charNavRef  = useRef(null);
 
@@ -73,32 +91,109 @@ export default function OnboardingScreen({ navigation }) {
     charNavRef.current?.scrollTo({ x: 0, animated: false });
   }, [activeGroupIdx]);
 
-  // ─── Guardar trazo ────────────────────────────────────────────────────
+  // Animar el indicador de tab activo al cambiar de sección
+  useEffect(() => {
+    const tabW = tabContainerW.current / CHARACTER_GROUPS.length;
+    Animated.spring(tabIndicatorAnim, {
+      toValue: activeGroupIdx * tabW,
+      useNativeDriver: true,
+      tension: 320,
+      friction: 32,
+    }).start();
+  }, [activeGroupIdx, tabIndicatorAnim]);
+
+  // ─── Guardar / actualizar trazo ──────────────────────────────────────
   const handleSave = useCallback(async () => {
-    if (!hasDrawn || isFull) return;
     const dataUrl = await canvasRef.current?.toDataUrl();
     if (!dataUrl) return;
+    const { paths, bbox } = canvasRef.current?.getPaths() ?? { paths: [], bbox: null };
+    const stroke = { dataUrl, paths, bbox };
 
-    addStroke(currentChar, dataUrl);
+    if (selectedStrokeIdx !== null) {
+      replaceStroke(currentChar, selectedStrokeIdx, stroke);
+      setSelectedStrokeIdx(null);
+    } else {
+      if (!hasDrawn || isFull) return;
+      addStroke(currentChar, stroke);
+    }
     canvasRef.current?.clear();
     setHasDrawn(false);
-  }, [hasDrawn, isFull, currentChar, addStroke]);
+  }, [hasDrawn, isFull, currentChar, addStroke, replaceStroke, selectedStrokeIdx]);
 
-  // ─── Borrar canvas ─────────────────────────────────────────────────────
-  const handleClear = useCallback(() => {
-    canvasRef.current?.clear();
-    setHasDrawn(false);
-  }, []);
+  // ─── Animación del panel de slider ───────────────────────────────────
+  const openSlider = useCallback((tool) => {
+    setSliderFor(tool);
+    Animated.timing(sliderAnim, {
+      toValue: SLIDER_PANEL_H,
+      duration: 220,
+      useNativeDriver: false,
+    }).start();
+  }, [sliderAnim]);
 
-  // ─── Alternar entre modo dibujo y goma ──────────────────────────────────
+  const closeSlider = useCallback((cb) => {
+    Animated.timing(sliderAnim, {
+      toValue: 0,
+      duration: 170,
+      useNativeDriver: false,
+    }).start(() => { setSliderFor(null); cb?.(); });
+  }, [sliderAnim]);
+
+  // ─── Íconos de herramienta ────────────────────────────────────────────
+  const handlePenIconPress = useCallback(() => {
+    if (isErasing) {
+      setIsErasing(false);
+      closeSlider();
+    } else {
+      if (sliderFor === 'pen') {
+        closeSlider();
+      } else if (sliderFor === 'eraser') {
+        closeSlider(() => openSlider('pen'));
+      } else {
+        openSlider('pen');
+      }
+    }
+  }, [isErasing, sliderFor, openSlider, closeSlider]);
+
+  const handleEraserIconPress = useCallback(() => {
+    if (!isErasing) {
+      setIsErasing(true);
+      closeSlider();
+    } else {
+      if (sliderFor === 'eraser') {
+        closeSlider();
+      } else if (sliderFor === 'pen') {
+        closeSlider(() => openSlider('eraser'));
+      } else {
+        openSlider('eraser');
+      }
+    }
+  }, [isErasing, sliderFor, openSlider, closeSlider]);
+
+  // ─── Botón lateral S Pen ──────────────────────────────────────────────
   const handleToggleEraser = useCallback(() => {
     setIsErasing(prev => !prev);
-  }, []);
+    closeSlider();
+  }, [closeSlider]);
+
+  // ─── Selección de trazo guardado para edición ────────────────────────
+  const handleThumbnailPress = useCallback((idx) => {
+    if (selectedStrokeIdx === idx) {
+      setSelectedStrokeIdx(null);
+      canvasRef.current?.clear();
+      setHasDrawn(false);
+    } else {
+      setSelectedStrokeIdx(idx);
+      const stroke = currentStrokes[idx];
+      canvasRef.current?.loadPaths(getStrokePaths(stroke));
+      setHasDrawn(false);
+    }
+  }, [selectedStrokeIdx, currentStrokes]);
 
   // ─── Navegar dentro del grupo activo ─────────────────────────────────
   const handleNext = useCallback(() => {
     if (currentIdx < lastInGroup) {
       setCurrentIdx(prev => prev + 1);
+      setSelectedStrokeIdx(null);
       canvasRef.current?.clear();
       setHasDrawn(false);
     }
@@ -107,6 +202,7 @@ export default function OnboardingScreen({ navigation }) {
   const handlePrev = useCallback(() => {
     if (currentIdx > firstInGroup) {
       setCurrentIdx(prev => prev - 1);
+      setSelectedStrokeIdx(null);
       canvasRef.current?.clear();
       setHasDrawn(false);
     }
@@ -115,6 +211,7 @@ export default function OnboardingScreen({ navigation }) {
   // ─── Saltar al carácter tocado en la barra ────────────────────────────
   const handleNavPress = useCallback((globalIdx) => {
     setCurrentIdx(globalIdx);
+    setSelectedStrokeIdx(null);
     canvasRef.current?.clear();
     setHasDrawn(false);
   }, []);
@@ -122,6 +219,7 @@ export default function OnboardingScreen({ navigation }) {
   // ─── Saltar al primer carácter de un tab ─────────────────────────────
   const handleTabPress = useCallback((groupIdx) => {
     setCurrentIdx(GROUP_OFFSETS[groupIdx]);
+    setSelectedStrokeIdx(null);
     canvasRef.current?.clear();
     setHasDrawn(false);
   }, []);
@@ -147,6 +245,13 @@ export default function OnboardingScreen({ navigation }) {
   const captured    = capturedCount();
   const progressPct = Math.round((captured / TOTAL_CHARS) * 100);
 
+  const isEditing = selectedStrokeIdx !== null;
+  const canSave   = isEditing || (hasDrawn && !isFull);
+  const saveLabel = isEditing ? 'Actualizar trazo' : 'Guardar trazo';
+  const hintText  = isEditing
+    ? 'Trazo cargado — usa la goma para borrar partes o añade trazos nuevos'
+    : (isFull ? 'Máximo de variaciones alcanzado para este carácter' : 'Escribe el carácter con tu lápiz o dedo');
+
   return (
     <SafeAreaView style={styles.safe}>
       <ScrollView
@@ -170,15 +275,32 @@ export default function OnboardingScreen({ navigation }) {
         </View>
         <Text style={styles.progressLabel}>Escribe cada carácter — mínimo 1 vez, recomendado 3</Text>
 
-        {/* ── Tabs de sección ───────────────────────────────────────── */}
-        <View style={styles.tabs}>
+        {/* ── Tabs de sección con indicador deslizante ─────────────── */}
+        <View
+          style={styles.tabs}
+          onLayout={(e) => {
+            tabContainerW.current = e.nativeEvent.layout.width;
+            // Posicionar el indicador sin animación en el primer layout
+            tabIndicatorAnim.setValue(
+              activeGroupIdx * (e.nativeEvent.layout.width / CHARACTER_GROUPS.length)
+            );
+          }}
+        >
+          {/* Indicador que se desliza detrás de los botones */}
+          <Animated.View
+            style={[
+              styles.tabIndicator,
+              { transform: [{ translateX: tabIndicatorAnim }] },
+            ]}
+          />
+
           {CHARACTER_GROUPS.map((group, i) => {
-            const isActive     = i === activeGroupIdx;
+            const isActive      = i === activeGroupIdx;
             const groupCaptured = group.chars.filter(c => strokesFor(c).length > 0).length;
             return (
               <TouchableOpacity
                 key={group.id}
-                style={[styles.tab, isActive && styles.tabActive]}
+                style={styles.tab}
                 onPress={() => handleTabPress(i)}
                 activeOpacity={0.7}
               >
@@ -226,10 +348,31 @@ export default function OnboardingScreen({ navigation }) {
           })}
         </ScrollView>
 
-        {/* ── Carácter actual ───────────────────────────────────────── */}
-        <View style={styles.charDisplay}>
-          <Text style={styles.charBig}>{currentChar}</Text>
-          <Text style={styles.charLabel}>{getCharLabel(currentChar)}</Text>
+        {/* ── Carácter actual con flechas de navegación ─────────────── */}
+        <View style={styles.charNav}>
+          <TouchableOpacity
+            style={[styles.arrowBtn, currentIdx === firstInGroup && styles.arrowDisabled]}
+            onPress={handlePrev}
+            disabled={currentIdx === firstInGroup}
+          >
+            <Text style={styles.arrowText}>‹</Text>
+          </TouchableOpacity>
+
+          <View style={styles.charDisplay}>
+            <Text style={styles.charBig}>{currentChar}</Text>
+            <Text style={styles.charLabel}>{getCharLabel(currentChar)}</Text>
+          </View>
+
+          <TouchableOpacity
+            style={[
+              styles.arrowBtn,
+              (currentStrokes.length < MIN_VARIATIONS || currentIdx === lastInGroup) && styles.arrowDisabled,
+            ]}
+            onPress={handleNext}
+            disabled={currentStrokes.length < MIN_VARIATIONS || currentIdx === lastInGroup}
+          >
+            <Text style={styles.arrowText}>›</Text>
+          </TouchableOpacity>
         </View>
 
         {/* ── Puntitos de variaciones ───────────────────────────────── */}
@@ -252,27 +395,47 @@ export default function OnboardingScreen({ navigation }) {
           </View>
         )}
 
-        {/* ── Toggle dibujo / goma ──────────────────────────────────── */}
-        <View style={styles.modeToggle}>
+        {/* ── Íconos de herramienta (lápiz / goma) ─────────────────── */}
+        <View style={styles.toolIcons}>
           <TouchableOpacity
-            style={[styles.modeBtn, !isErasing && styles.modeBtnActive]}
-            onPress={() => setIsErasing(false)}
+            style={[styles.toolIconBtn, !isErasing && styles.toolIconBtnActive]}
+            onPress={handlePenIconPress}
             activeOpacity={0.8}
           >
-            <Text style={[styles.modeBtnText, !isErasing && styles.modeBtnTextActive]}>
-              Dibujar
-            </Text>
+            <Text style={[styles.toolIconText, !isErasing && styles.toolIconTextActive]}>✏</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.modeBtn, isErasing && styles.modeBtnActive]}
-            onPress={() => setIsErasing(true)}
+            style={[styles.toolIconBtn, isErasing && styles.toolIconBtnActive]}
+            onPress={handleEraserIconPress}
             activeOpacity={0.8}
           >
-            <Text style={[styles.modeBtnText, isErasing && styles.modeBtnTextActive]}>
-              Goma
-            </Text>
+            <View style={[styles.eraserIcon, isErasing && styles.eraserIconActive]} />
           </TouchableOpacity>
         </View>
+
+        {/* ── Panel de slider animado — un slider a la vez ─────────── */}
+        <Animated.View style={[styles.sliderPanel, { height: sliderAnim }]}>
+          {sliderFor === 'pen' && (
+            <SizeSlider
+              label="Grosor del lápiz"
+              value={penWidth}
+              min={1}
+              max={12}
+              onValueChange={setPenWidth}
+              isEraser={false}
+            />
+          )}
+          {sliderFor === 'eraser' && (
+            <SizeSlider
+              label="Tamaño de la goma"
+              value={eraserRad}
+              min={3}
+              max={40}
+              onValueChange={setEraserRad}
+              isEraser={true}
+            />
+          )}
+        </Animated.View>
 
         {/* ── Canvas de dibujo ──────────────────────────────────────── */}
         <DrawingCanvas
@@ -282,77 +445,59 @@ export default function OnboardingScreen({ navigation }) {
           isErasing={isErasing}
           onToggleEraser={handleToggleEraser}
           onStrokeEnd={() => setHasDrawn(true)}
+          strokeWidth={penWidth}
+          eraserRadius={eraserRad}
         />
-        <Text style={styles.canvasHint}>
-          {isFull
-            ? 'Máximo de variaciones alcanzado para este carácter'
-            : 'Escribe el carácter con tu lápiz o dedo'}
-        </Text>
+        <Text style={styles.canvasHint}>{hintText}</Text>
 
-        {/* ── Trazos guardados ──────────────────────────────────────── */}
+        {/* ── Trazos guardados — toca para editar, selección exclusiva ─ */}
         {currentStrokes.length > 0 && (
           <View style={styles.savedSection}>
-            <Text style={styles.savedLabel}>TRAZOS GUARDADOS — toca uno para eliminar</Text>
+            <Text style={styles.savedLabel}>
+              TRAZOS GUARDADOS — toca uno para editarlo
+            </Text>
             <View style={styles.savedRow}>
-              {currentStrokes.map((dataUrl, idx) => (
+              {currentStrokes.map((stroke, idx) => (
                 <StrokeThumbnail
                   key={idx}
-                  dataUrl={dataUrl}
-                  onDelete={() => deleteStroke(currentChar, idx)}
+                  dataUrl={getStrokeDataUrl(stroke)}
+                  isSelected={selectedStrokeIdx === idx}
+                  onPress={() => handleThumbnailPress(idx)}
+                  onDelete={() => {
+                    setSelectedStrokeIdx(null);
+                    canvasRef.current?.clear();
+                    setHasDrawn(false);
+                    deleteStroke(currentChar, idx);
+                  }}
                 />
               ))}
             </View>
           </View>
         )}
 
-        {/* ── Botones de acción ─────────────────────────────────────── */}
-        <View style={styles.actionRow}>
-          <TouchableOpacity style={styles.btnSecondary} onPress={handleClear}>
-            <Text style={styles.btnSecondaryText}>Borrar</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.btnPrimary, (!hasDrawn || isFull) && styles.btnDisabled]}
-            onPress={handleSave}
-            disabled={!hasDrawn || isFull}
-          >
-            <Text style={styles.btnPrimaryText}>Guardar trazo</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* ── Navegación prev / next dentro de la sección ──────────── */}
-        <View style={styles.navRow}>
-          <TouchableOpacity
-            style={[styles.btnNav, currentIdx === firstInGroup && styles.btnDisabled]}
-            onPress={handlePrev}
-            disabled={currentIdx === firstInGroup}
-          >
-            <Text style={styles.btnNavText}>← Anterior</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[
-              styles.btnNav,
-              (currentStrokes.length < MIN_VARIATIONS || currentIdx === lastInGroup) && styles.btnDisabled,
-            ]}
-            onPress={handleNext}
-            disabled={currentStrokes.length < MIN_VARIATIONS || currentIdx === lastInGroup}
-          >
-            <Text style={styles.btnNavText}>Siguiente →</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* ── Botón de finalizar ────────────────────────────────────── */}
-        {captured >= 1 && (
-          <TouchableOpacity
-            style={[styles.btnFinish, done && styles.btnFinishReady]}
-            onPress={handleFinish}
-          >
-            <Text style={[styles.btnFinishText, done && styles.btnFinishTextReady]}>
-              {done ? '¡Listo! Empezar a usar la app' : 'Continuar con los caracteres capturados'}
-            </Text>
-          </TouchableOpacity>
-        )}
+        {/* ── Guardar / Actualizar trazo ────────────────────────────── */}
+        <TouchableOpacity
+          style={[styles.btnSave, !canSave && styles.btnDisabled]}
+          onPress={handleSave}
+          disabled={!canSave}
+        >
+          <Text style={styles.btnSaveText}>{saveLabel}</Text>
+        </TouchableOpacity>
 
       </ScrollView>
+
+      {/* ── Botón continuar — fijo en esquina inferior derecha ───── */}
+      {captured >= 1 && (
+        <TouchableOpacity
+          style={[styles.btnFinish, done && styles.btnFinishReady]}
+          onPress={handleFinish}
+        >
+          <Text style={[styles.btnFinishText, done && styles.btnFinishTextReady]}>
+            {done ? '¡Listo! →' : 'Continuar →'}
+          </Text>
+        </TouchableOpacity>
+      )}
+
     </SafeAreaView>
   );
 }
@@ -366,7 +511,7 @@ const styles = StyleSheet.create({
   scroll: { flex: 1 },
   scrollContent: {
     padding: spacing.lg,
-    paddingBottom: spacing.xxl,
+    paddingBottom: 80,
   },
 
   // Header
@@ -424,15 +569,22 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
     backgroundColor: colors.hueso2,
   },
+  // Indicador deslizante — detrás de los botones en el árbol JSX
+  tabIndicator: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    width: `${100 / CHARACTER_GROUPS.length}%`,
+    backgroundColor: colors.grafito,
+    borderRadius: radius.md - 1,
+  },
   tab: {
     flex: 1,
     paddingVertical: spacing.sm,
     paddingHorizontal: 4,
     alignItems: 'center',
     gap: 2,
-  },
-  tabActive: {
-    backgroundColor: colors.grafito,
   },
   tabLabel: {
     fontSize: 10,
@@ -485,10 +637,30 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 
-  // Carácter principal
+  // Carácter con flechas pegadas a los lados
+  charNav: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: spacing.lg,
+  },
+  arrowBtn: {
+    paddingHorizontal: spacing.sm,
+    height: 80,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: radius.md,
+  },
+  arrowDisabled: {
+    opacity: 0.18,
+  },
+  arrowText: {
+    fontSize: 36,
+    color: colors.grafito,
+    lineHeight: 44,
+  },
   charDisplay: {
     alignItems: 'center',
-    marginVertical: spacing.lg,
   },
   charBig: {
     fontSize: 72,
@@ -535,31 +707,51 @@ const styles = StyleSheet.create({
     color: colors.piedra,
     textAlign: 'center',
   },
-  // Toggle dibujo / goma
-  modeToggle: {
+
+  // Íconos de herramienta
+  toolIcons: {
     flexDirection: 'row',
     alignSelf: 'center',
-    borderRadius: radius.full,
-    borderWidth: borderWidth.thin,
-    borderColor: colors.borde,
-    overflow: 'hidden',
+    gap: spacing.sm,
     marginBottom: spacing.sm,
+  },
+  toolIconBtn: {
+    width: 52,
+    height: 52,
+    borderRadius: radius.md,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: borderWidth.normal,
+    borderColor: colors.borde,
     backgroundColor: colors.hueso2,
   },
-  modeBtn: {
-    paddingHorizontal: spacing.xl,
-    paddingVertical: spacing.xs + 2,
-  },
-  modeBtnActive: {
+  toolIconBtnActive: {
     backgroundColor: colors.grafito,
+    borderColor: colors.grafito,
   },
-  modeBtnText: {
-    fontSize: fontSizes.sm,
+  toolIconText: {
+    fontSize: 22,
     color: colors.carbon,
-    fontWeight: '500',
   },
-  modeBtnTextActive: {
+  toolIconTextActive: {
     color: colors.hueso,
+  },
+  eraserIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: colors.carbon,
+    backgroundColor: 'transparent',
+  },
+  eraserIconActive: {
+    borderColor: colors.hueso,
+  },
+  // Panel animado del slider
+  sliderPanel: {
+    overflow: 'hidden',
+    marginBottom: spacing.xs,
+    justifyContent: 'center',
   },
 
   // Canvas
@@ -585,69 +777,42 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
   },
 
-  // Botones
-  actionRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
-  },
-  btnSecondary: {
-    flex: 1,
-    paddingVertical: spacing.md,
-    borderRadius: radius.md,
-    borderWidth: borderWidth.thin,
-    borderColor: colors.borde,
-    alignItems: 'center',
-  },
-  btnSecondaryText: {
-    fontSize: fontSizes.md,
-    color: colors.carbon,
-  },
-  btnPrimary: {
-    flex: 1,
-    paddingVertical: spacing.md,
+  // Guardar trazo — prominente y ancho completo
+  btnSave: {
+    paddingVertical: spacing.lg,
     borderRadius: radius.md,
     backgroundColor: colors.grafito,
     alignItems: 'center',
+    marginBottom: spacing.sm,
   },
-  btnPrimaryText: {
-    fontSize: fontSizes.md,
+  btnSaveText: {
+    fontSize: fontSizes.base,
     color: colors.hueso,
-    fontWeight: '500',
+    fontWeight: '600',
+    letterSpacing: 0.3,
   },
   btnDisabled: {
     opacity: 0.35,
   },
-  navRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-    marginBottom: spacing.md,
-  },
-  btnNav: {
-    flex: 1,
-    paddingVertical: spacing.md,
-    borderRadius: radius.md,
-    borderWidth: borderWidth.thin,
-    borderColor: colors.borde,
-    alignItems: 'center',
-  },
-  btnNavText: {
-    fontSize: fontSizes.md,
-    color: colors.carbon,
-  },
+
+  // Botón continuar — posición fija en esquina inferior derecha
   btnFinish: {
-    paddingVertical: spacing.md,
-    borderRadius: radius.md,
+    position: 'absolute',
+    bottom: spacing.xl,
+    right: spacing.lg,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.full,
     borderWidth: borderWidth.normal,
     borderColor: colors.grafito,
-    alignItems: 'center',
-    marginTop: spacing.xs,
+    backgroundColor: colors.hueso,
   },
   btnFinishReady: {
     backgroundColor: colors.grafito,
+    borderColor: colors.grafito,
   },
   btnFinishText: {
-    fontSize: fontSizes.md,
+    fontSize: fontSizes.sm,
     color: colors.grafito,
     fontWeight: '500',
   },

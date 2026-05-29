@@ -1,17 +1,15 @@
 /**
  * StrokeThumbnail.js
- * Miniatura de un trazo guardado con selección y eliminación.
+ * Miniatura de un trazo guardado con selección controlada por el padre.
  *
- * Comportamiento:
- * - Primer toque  → selecciona (borde rojo + ×)
- * - Segundo toque → deselecciona (cancela)
- * - Botón rojo    → confirma eliminación
- *
- * La imagen recibe un PNG ya recortado al bounding box del trazo,
- * por lo que se muestra grande y limpio con resizeMode="contain".
+ * Props:
+ *   dataUrl    — PNG base64 del trazo recortado
+ *   isSelected — controlado desde afuera (selección exclusiva)
+ *   onPress    — toggle selección
+ *   onDelete   — eliminar este trazo (visible solo cuando isSelected)
  */
 
-import React, { useState } from 'react';
+import React from 'react';
 import {
   View,
   Image,
@@ -21,18 +19,13 @@ import {
 } from 'react-native';
 import { colors, radius, borderWidth } from '../constants/theme';
 
-export default function StrokeThumbnail({ dataUrl, onDelete }) {
-  const [selected, setSelected] = useState(false);
-
-  const handlePress   = () => setSelected(prev => !prev);
-  const handleDelete  = () => { setSelected(false); onDelete(); };
-
+export default function StrokeThumbnail({ dataUrl, isSelected, onPress, onDelete }) {
   return (
     <View style={styles.wrapper}>
       <TouchableOpacity
-        onPress={handlePress}
+        onPress={onPress}
         activeOpacity={0.8}
-        style={[styles.thumb, selected && styles.thumbSelected]}
+        style={[styles.thumb, isSelected && styles.thumbSelected]}
       >
         <Image
           source={{ uri: dataUrl }}
@@ -40,15 +33,15 @@ export default function StrokeThumbnail({ dataUrl, onDelete }) {
           resizeMode="contain"
         />
 
-        {selected && (
+        {isSelected && (
           <View style={styles.badge}>
-            <Text style={styles.badgeText}>×</Text>
+            <Text style={styles.badgeText}>✓</Text>
           </View>
         )}
       </TouchableOpacity>
 
-      {selected && (
-        <TouchableOpacity style={styles.deleteBtn} onPress={handleDelete}>
+      {isSelected && (
+        <TouchableOpacity style={styles.deleteBtn} onPress={onDelete}>
           <Text style={styles.deleteBtnText}>Eliminar</Text>
         </TouchableOpacity>
       )}
@@ -73,7 +66,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   thumbSelected: {
-    borderColor: colors.error,
+    borderColor: colors.grafito,
   },
   image: {
     width: 80,
@@ -86,15 +79,15 @@ const styles = StyleSheet.create({
     width: 20,
     height: 20,
     borderRadius: 10,
-    backgroundColor: colors.error,
+    backgroundColor: colors.grafito,
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 1.5,
     borderColor: colors.hueso2,
   },
   badgeText: {
-    color: colors.blanco,
-    fontSize: 13,
+    color: colors.hueso,
+    fontSize: 11,
     fontWeight: '600',
     lineHeight: 14,
   },
