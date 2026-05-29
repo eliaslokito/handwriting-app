@@ -68,6 +68,7 @@ export default function OnboardingScreen({ navigation }) {
   const [sliderFor,         setSliderFor]         = useState(null); // 'pen' | 'eraser' | null
   const sliderAnim       = useRef(new Animated.Value(0)).current;
   const tabIndicatorAnim = useRef(new Animated.Value(0)).current;
+  const btnAnim          = useRef(new Animated.Value(0)).current;
   const tabContainerW    = useRef(0);
   const canvasRef   = useRef(null);
   const charNavRef  = useRef(null);
@@ -245,9 +246,21 @@ export default function OnboardingScreen({ navigation }) {
   const captured    = capturedCount();
   const progressPct = Math.round((captured / TOTAL_CHARS) * 100);
 
-  const isEditing = selectedStrokeIdx !== null;
-  const canSave   = isEditing || (hasDrawn && !isFull);
-  const saveLabel = isEditing ? 'Actualizar trazo' : 'Guardar trazo';
+  const isEditing   = selectedStrokeIdx !== null;
+  const canSave     = isEditing || (hasDrawn && !isFull);
+  const saveLabel   = isEditing ? 'Actualizar trazo' : 'Guardar trazo';
+  // Botón se convierte en "Siguiente letra →" cuando el carácter ya tiene 3 variaciones
+  const showNextBtn = isFull && !isEditing;
+
+  // Animar la transición del botón Guardar ↔ Siguiente letra
+  useEffect(() => {
+    Animated.timing(btnAnim, {
+      toValue: showNextBtn ? 1 : 0,
+      duration: 300,
+      useNativeDriver: false,
+    }).start();
+  }, [showNextBtn, btnAnim]);
+
   const hintText  = isEditing
     ? 'Trazo cargado — usa la goma para borrar partes o añade trazos nuevos'
     : (isFull ? 'Máximo de variaciones alcanzado para este carácter' : 'Escribe el carácter con tu lápiz o dedo');
@@ -475,13 +488,43 @@ export default function OnboardingScreen({ navigation }) {
           </View>
         )}
 
-        {/* ── Guardar / Actualizar trazo ────────────────────────────── */}
+        {/* ── Guardar / Actualizar trazo / Siguiente letra ─────────── */}
         <TouchableOpacity
-          style={[styles.btnSave, !canSave && styles.btnDisabled]}
-          onPress={handleSave}
-          disabled={!canSave}
+          onPress={showNextBtn ? handleNext : handleSave}
+          disabled={!showNextBtn && !canSave}
+          activeOpacity={0.8}
         >
-          <Text style={styles.btnSaveText}>{saveLabel}</Text>
+          <Animated.View
+            style={[
+              styles.btnSave,
+              !showNextBtn && !canSave && styles.btnDisabled,
+              {
+                backgroundColor: btnAnim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [colors.grafito, '#8B6F47'],
+                }),
+              },
+            ]}
+          >
+            <View style={styles.btnSaveInner}>
+              <Animated.Text
+                style={[
+                  styles.btnSaveText,
+                  {
+                    position: 'absolute',
+                    opacity: btnAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 0] }),
+                  },
+                ]}
+              >
+                {saveLabel}
+              </Animated.Text>
+              <Animated.Text
+                style={[styles.btnSaveText, styles.btnNextText, { position: 'absolute', opacity: btnAnim }]}
+              >
+                Siguiente letra →
+              </Animated.Text>
+            </View>
+          </Animated.View>
         </TouchableOpacity>
 
       </ScrollView>
@@ -785,11 +828,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: spacing.sm,
   },
+  // Contenedor de altura fija para el crossfade de textos absolutamente posicionados
+  btnSaveInner: {
+    height: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   btnSaveText: {
     fontSize: fontSizes.base,
     color: colors.hueso,
     fontWeight: '600',
     letterSpacing: 0.3,
+  },
+  btnNextText: {
+    color: '#F2EFE6',
   },
   btnDisabled: {
     opacity: 0.35,

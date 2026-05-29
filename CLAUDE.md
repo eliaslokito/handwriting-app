@@ -198,6 +198,7 @@ Recibe `{ text, sheetFormat, fontSize }` por `route.params`. Tokeniza el texto c
 - Formato vectorial con bbox — listo para renderizado escalable en Preview
 - Goma de borrar con cursor visual + detección de botón S Pen
 - Botón "Continuar →" fijo en esquina inferior derecha
+- **Botón adaptativo "Guardar trazo" ↔ "Siguiente letra →"**: al completar 3 variaciones el botón transiciona con animación fluida (300ms) al color terracota `#8B6F47` con texto `#F2EFE6`; al presionarlo navega al siguiente carácter. En modo edición (`selectedStrokeIdx !== null`) siempre muestra "Actualizar trazo".
 
 ### MainScreen — Funcional
 - Área de texto + selector de formato (rayada/cuadriculada/en blanco) + tamaño de letra
@@ -234,6 +235,7 @@ Recibe `{ text, sheetFormat, fontSize }` por `route.params`. Tokeniza el texto c
 | Selección de trazo para edición borraba el canvas | `loadPaths()` restaura Skia paths exactos desde puntos serializados |
 | PreviewScreen solo mostraba fallback de texto | `CharacterToken` implementado con `catmullRomToSkia` + `computeTransform` + Skia `<Group>` |
 | Tabs cambiaban de golpe | Indicador `Animated.spring` con `translateX` + `useNativeDriver: true` |
+| Botón "Guardar trazo" sin feedback al llegar a 3 variaciones | `btnAnim` (`Animated.Value` 0→1) interpola `backgroundColor` + crossfade de texto con dos `Animated.Text` absolutamente posicionados; `useNativeDriver: false` requerido para interpolación de color |
 
 ---
 
